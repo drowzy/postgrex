@@ -559,6 +559,19 @@ defmodule Postgrex.Protocol do
     result
   end
 
+  @spec handle_replication(String.t(), Keyword.t(), state) ::
+          {:ok, Postgrex.Result.t(), state}
+          | {:error, Postgrex.Error.t(), state}
+          | {:disconnect, %DBConnection.ConnectionError{}, state}
+  def handle_replication(statement, opts, s) do
+    %{buffer: buffer, timeout: timeout, sock: sock} = s
+    status = new_status(opts)
+    timer = start_listener_timer(timeout, sock)
+    result = replication(%{s | buffer: nil}, status, statement, buffer)
+    cancel_listener_timer(timer)
+    result
+  end
+
   @spec handle_info(any, Keyword.t(), state) ::
           {:ok, state}
           | {:error, Postgrex.Error.t(), state}
@@ -1021,6 +1034,43 @@ defmodule Postgrex.Protocol do
   defp type_fetch_error() do
     msg = "awaited on another connection that failed to bootstrap types"
     DBConnection.ConnectionError.exception(msg)
+  end
+
+  ## replication
+  defp replication(s, status, statement, buffer) do
+    s = %{s | buffer: nil}
+
+    msgs = [
+      msg_query(statement: statement)
+    ]
+
+    with :ok <- msg_send(s, msgs, buffer),
+         {:ok, result, s, buffer} <- recv_replication(s, status, buffer) do
+      {:ok, result, %{s | buffer: buffer}}
+    else
+      {:error, %Postgrex.Error{} = err, s, buffer} ->
+        error_ready(s, status, err, buffer)
+
+      {:disconnect, _err, _s} = disconnect ->
+        disconnect
+    end
+  end
+
+  defp recv_replication(s, status, buffer) do
+    case msg_recv(s, :infinity, buffer) do
+      {:ok, msg_copy_both_response(format: _, columns: _), buffer} ->
+        {:ok, done(s, status, ["START_REPLICATION"]), s, buffer}
+
+      {:ok, msg_error(fields: fields), buffer} ->
+        {:error, Postgrex.Error.exception(postgres: fields), s, buffer}
+
+      {:ok, msg, buffer} ->
+        {s, status} = handle_msg(s, status, msg)
+        recv_replication(s, status, buffer)
+
+      {:disconnect, _, _} = dis ->
+        dis
+    end
   end
 
   ## listener
@@ -3088,6 +3138,45 @@ defmodule Postgrex.Protocol do
     notify.(channel, payload)
     {s, status}
   end
+
+  ## replication
+
+  defp handle_msg(s, status, msg_copy_data(data: data)) do
+    %{notify: notify} = status
+    <<type::int8, rest::binary>> = data
+
+    msg =
+      case parse(rest, type, 0) do
+        msg_primary_keep_alive(server_wal: sw, system_clock: sc, reply?: 1) ->
+          standby_update =
+            msg_standby_status_update(
+              wal_recv: sw + 1,
+              wal_flush: sw + 1,
+              wal_apply: sw + 1,
+              system_clock: sc,
+              reply?: 0
+            )
+
+          msg = msg_copy_data(data: standby_update)
+          :ok = msg_send(s, msg, <<>>)
+          {:primary_keep_alive, sw, sc, 1, standby_update}
+
+        msg_primary_keep_alive(server_wal: sw, system_clock: sc, reply?: reply) ->
+          {:primary_keep_alive, sw, sc, reply}
+
+        msg_xlog_data(start_lsn: start_lsn, end_lsn: end_lsn, data: data) ->
+          {:x_log_data, start_lsn, end_lsn, data}
+      end
+
+    notify.(msg)
+    {s, status}
+  end
+
+  # defp handle_msg(s, status, msg_xlog_data(start_lsn: start_lsn, end_lsn: end_lsn, data: data)) do
+  #   %{notify: notify} = status
+  #   notify.({:x_log_data, start_lsn, end_lsn, data})
+  #   {s, status}
+  # end
 
   defp handle_msg(s, status, msg_notice(fields: fields)) do
     {s, update_in(status.messages, &[fields | &1])}

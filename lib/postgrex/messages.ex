@@ -78,7 +78,17 @@ defmodule Postgrex.Messages do
   defrecord :msg_terminate, []
   defrecord :msg_ssl_request, []
   defrecord :msg_cancel_request, [:pid, :key]
+  defrecord :msg_primary_keep_alive, [:server_wal, :system_clock, :reply?]
 
+  defrecord :msg_standby_status_update, [
+    :wal_recv,
+    :wal_flush,
+    :wal_apply,
+    :system_clock,
+    :reply?
+  ]
+
+  defrecord :msg_xlog_data, [:start_lsn, :end_lsn, :data]
   defrecord :row_field, [:name, :table_oid, :column, :type_oid, :type_size, :type_mod, :format]
 
   ### decoders ###
@@ -165,6 +175,14 @@ defmodule Postgrex.Messages do
     {channel, rest} = decode_string(rest)
     {payload, ""} = decode_string(rest)
     msg_notify(pg_pid: pg_pid, channel: channel, payload: payload)
+  end
+
+  def parse(<<start_lsn::int64, end_lsn::int64, rest::binary>>, ?w, _size) do
+    msg_xlog_data(start_lsn: start_lsn, end_lsn: end_lsn, data: rest)
+  end
+
+  def parse(<<server_wal::int64, system_clock::int64, reply::int8>>, ?k, _size) do
+    msg_primary_keep_alive(server_wal: server_wal, system_clock: system_clock, reply?: reply)
   end
 
   # error
@@ -368,9 +386,34 @@ defmodule Postgrex.Messages do
     {nil, <<1234::int16, 5678::int16, pid::int32, key::int32>>}
   end
 
+  defp encode(
+         msg_standby_status_update(
+           wal_recv: wal_recv,
+           wal_flush: wal_flush,
+           wal_apply: wal_apply,
+           system_clock: system_clock,
+           reply?: reply
+         )
+       ) do
+    msg = <<
+      wal_recv::int64,
+      wal_flush::int64,
+      wal_apply::int64,
+      system_clock::int64,
+      reply::int8
+    >>
+
+    {?h, msg}
+  end
+
   # copy_data
-  defp encode(msg_copy_data(data: data)) do
+  defp encode(msg_copy_data(data: data)) when is_list(data) or is_binary(data) do
     {?d, data}
+  end
+
+  defp encode(msg_copy_data(data: data)) do
+    {type, data} = encode(data)
+    {?d, [type, data]}
   end
 
   # copy_done
